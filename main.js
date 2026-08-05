@@ -209,47 +209,10 @@ function setPill(state, text) {
 
 // ---- Decart Lucy 2.5 (realtime video-to-video over WebRTC) ----
 
-// WebRTC receivers buffer incoming frames to smooth out network jitter, and
-// the default target is tuned for conversational video — it will happily hold
-// 100-200ms of frames. For a live effect, a dropped frame is cheaper than a
-// late one, so ask for the smallest buffer the UA will give us. The SDK owns
-// the peer connection, so note every one that gets constructed and tune the
-// receivers once the remote track arrives.
-const peerConnections = new Set();
-function observePeerConnections() {
-  const Native = window.RTCPeerConnection;
-  if (!Native || Native.__fingerFramePatched) return;
-  const Patched = function (...args) {
-    const pc = new Native(...args);
-    peerConnections.add(pc);
-    return pc;
-  };
-  Patched.prototype = Native.prototype;
-  Patched.__fingerFramePatched = true;
-  Object.setPrototypeOf(Patched, Native);
-  window.RTCPeerConnection = Patched;
-}
-
-function minimizeJitterBuffer() {
-  for (const pc of peerConnections) {
-    for (const receiver of pc.getReceivers?.() ?? []) {
-      if (receiver.track?.kind !== "video") continue;
-      try {
-        // Standard (Chrome 114+); `playoutDelayHint` is the legacy spelling.
-        if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = 0;
-        else if ("playoutDelayHint" in receiver) receiver.playoutDelayHint = 0;
-      } catch (err) {
-        console.warn("jitter buffer hint rejected:", err);
-      }
-    }
-  }
-}
-
 async function connectLucy() {
   if (!apiKey || !cameraStream || DEMO) return;
   try {
     setPill("connecting", "CONNECTING…");
-    observePeerConnections();
     const { createDecartClient, models } = await import(DECART_SDK_URL);
     const model = models.realtime("lucy-2.5");
     const client = createDecartClient({ apiKey });
@@ -259,7 +222,6 @@ async function connectLucy() {
       onRemoteStream: (stream) => {
         lucyVid.srcObject = stream;
         lucyVid.play().catch(() => {});
-        minimizeJitterBuffer();
         lucyLive = true;
         setPill("", "LIVE");
       },
