@@ -20,8 +20,13 @@ const INDEX_MCP = 5;
 
 const video = document.getElementById("video");
 const lucyVid = document.getElementById("lucy");
+const shell = document.getElementById("shell");
 const canvas = document.getElementById("canvas");
-const ctx = canvas.getContext("2d");
+// `desynchronized` opts into a low-latency present path (skips a compositor
+// frame where supported); `alpha` is required now that the camera passthrough
+// lives in the video element behind us rather than in the canvas itself.
+const ctx = canvas.getContext("2d", { desynchronized: true, alpha: true });
+const hudEl = document.getElementById("hud");
 const statusEl = document.getElementById("status");
 const statusText = document.getElementById("status-text");
 const hintEl = document.getElementById("hint");
@@ -84,9 +89,53 @@ let realtimeClient = null;
 let lucyLive = false;
 let cameraStream = null;
 
-// Smoothed quad corners + presence fade (0..1).
+// Filtered quad corners ({x, y, vx, vy} per corner) + presence fade (0..1).
 let corners = null;
 let presence = 0;
+
+// ---- Latency budget ------------------------------------------------------
+// One Euro filter (Casiez et al., CHI 2012). A fixed-alpha EMA has to pick one
+// point on the jitter/lag curve and live with it; One Euro moves along that
+// curve with hand speed — heavy smoothing when still (no visible jitter), and
+// the cutoff opens up the instant the hands move (no visible trailing).
+const MIN_CUTOFF = 1.1; // Hz, at rest
+const CUTOFF_SLOPE = 14; // Hz per screen-width/second of corner speed
+const DERIV_CUTOFF = 1.0; // Hz, velocity estimate is noisy — smooth it hard
+
+// Everything the filter can't remove is *transport* lag: the camera frame is
+// already ~1 frame old when MediaPipe sees it, inference costs some more, and
+// the pixels we draw light up a compositor frame later. That lag is knowable,
+// so extrapolate along the filtered velocity to where the corner will be when
+// it is actually seen, rather than drawing where it used to be.
+const PRESENT_LOOKAHEAD_MS = 8; // draw -> photons
+const MAX_EXTRAPOLATE_MS = 55; // never predict further than this
+const MAX_EXTRAPOLATE_FRAC = 0.05; // ...nor further than 5% of the screen
+// Presence fade, in seconds-to-converge rather than per-frame steps, so a
+// 120 Hz display doesn't fade twice as fast as a 60 Hz one.
+const PRESENCE_RISE = 0.09;
+const PRESENCE_FALL = 0.22;
+
+// Timestamp of the camera frame the current `corners` were measured from, and
+// the wall clock when that measurement landed — the extrapolation baseline.
+let lastDetectAt = 0;
+let lastDrawAt = 0;
+
+// Latency HUD (press L).
+let hudOn = false;
+const detectMs = { last: 0, avg: 0 };
+const drawMs = { last: 0, avg: 0 };
+let detectHz = 0;
+
+function ema(acc, v) {
+  acc.last = v;
+  acc.avg = acc.avg ? acc.avg + (v - acc.avg) * 0.08 : v;
+}
+
+// One Euro low-pass coefficient for a given cutoff and timestep.
+function lpAlpha(dt, cutoff) {
+  const tau = 1 / (2 * Math.PI * cutoff);
+  return 1 / (1 + tau / dt);
+}
 // True while a frame is being shown — relaxes the gesture gate (hysteresis).
 let frameActive = false;
 // Frames since the quad was last seen; short dropouts hold the last quad.
@@ -100,8 +149,6 @@ const JUMP_CONFIRM_FRAMES = 2;
 let jumpFrames = 0;
 
 let landmarker = null;
-let lastVideoTime = -1;
-let lastResults = null;
 
 function currentPrompt() {
   const e = EFFECTS.find((x) => x.id === effect);
@@ -161,10 +208,48 @@ function setPill(state, text) {
 }
 
 // ---- Decart Lucy 2.5 (realtime video-to-video over WebRTC) ----
+
+// WebRTC receivers buffer incoming frames to smooth out network jitter, and
+// the default target is tuned for conversational video — it will happily hold
+// 100-200ms of frames. For a live effect, a dropped frame is cheaper than a
+// late one, so ask for the smallest buffer the UA will give us. The SDK owns
+// the peer connection, so note every one that gets constructed and tune the
+// receivers once the remote track arrives.
+const peerConnections = new Set();
+function observePeerConnections() {
+  const Native = window.RTCPeerConnection;
+  if (!Native || Native.__fingerFramePatched) return;
+  const Patched = function (...args) {
+    const pc = new Native(...args);
+    peerConnections.add(pc);
+    return pc;
+  };
+  Patched.prototype = Native.prototype;
+  Patched.__fingerFramePatched = true;
+  Object.setPrototypeOf(Patched, Native);
+  window.RTCPeerConnection = Patched;
+}
+
+function minimizeJitterBuffer() {
+  for (const pc of peerConnections) {
+    for (const receiver of pc.getReceivers?.() ?? []) {
+      if (receiver.track?.kind !== "video") continue;
+      try {
+        // Standard (Chrome 114+); `playoutDelayHint` is the legacy spelling.
+        if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = 0;
+        else if ("playoutDelayHint" in receiver) receiver.playoutDelayHint = 0;
+      } catch (err) {
+        console.warn("jitter buffer hint rejected:", err);
+      }
+    }
+  }
+}
+
 async function connectLucy() {
   if (!apiKey || !cameraStream || DEMO) return;
   try {
     setPill("connecting", "CONNECTING…");
+    observePeerConnections();
     const { createDecartClient, models } = await import(DECART_SDK_URL);
     const model = models.realtime("lucy-2.5");
     const client = createDecartClient({ apiKey });
@@ -174,6 +259,7 @@ async function connectLucy() {
       onRemoteStream: (stream) => {
         lucyVid.srcObject = stream;
         lucyVid.play().catch(() => {});
+        minimizeJitterBuffer();
         lucyLive = true;
         setPill("", "LIVE");
       },
@@ -270,10 +356,50 @@ async function init() {
 
   canvas.width = video.videoWidth;
   canvas.height = video.videoHeight;
+  shell.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
 
   statusEl.classList.add("hidden");
   if (apiKey && !DEMO) connectLucy();
-  requestAnimationFrame(loop);
+
+  // Detection is driven by the camera, drawing by the display. Coupling them
+  // (the old single rAF loop) meant a fresh camera frame could sit unlooked-at
+  // for a whole display frame, and that between detections the quad was frozen
+  // — on a 120Hz panel, three of every four drawn frames were stale.
+  startDetectLoop();
+  requestAnimationFrame(drawLoop);
+
+  window.addEventListener("keydown", (ev) => {
+    if (ev.key === "l" || ev.key === "L") {
+      hudOn = !hudOn;
+      hudEl.classList.toggle("hidden", !hudOn);
+    }
+  });
+}
+
+// Run the landmarker once per *camera* frame, as soon as that frame exists.
+function startDetectLoop() {
+  // requestVideoFrameCallback fires on frame arrival and hands us `mediaTime`,
+  // the frame's own presentation timestamp. MediaPipe's VIDEO mode uses that
+  // timestamp to drive its internal tracker, so feeding it wall-clock time
+  // (as this used to) misreports the frame interval and degrades tracking.
+  if (typeof video.requestVideoFrameCallback === "function") {
+    const onFrame = (now, meta) => {
+      detect(meta.mediaTime * 1000, now);
+      video.requestVideoFrameCallback(onFrame);
+    };
+    video.requestVideoFrameCallback(onFrame);
+    return;
+  }
+  // Firefox has no rVFC yet: fall back to polling currentTime off rAF.
+  let lastVideoTime = -1;
+  const poll = () => {
+    if (video.currentTime !== lastVideoTime) {
+      lastVideoTime = video.currentTime;
+      detect(video.currentTime * 1000, performance.now());
+    }
+    requestAnimationFrame(poll);
+  };
+  requestAnimationFrame(poll);
 }
 
 // Draw a (mirrored) source onto any 2d context, filling w x h.
@@ -292,10 +418,6 @@ function toPixel(lm) {
 
 function dist(a, b) {
   return Math.hypot(a.x - b.x, a.y - b.y);
-}
-
-function lerpPt(a, b, t) {
-  return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
 }
 
 // Given landmark sets for exactly two hands, return the 4 frame corners in
@@ -399,15 +521,17 @@ function drawFrameOutline(q) {
   ctx.setLineDash([10, 8]);
   // Marching ants: slide the dash pattern along the outline.
   ctx.lineDashOffset = -t * 40;
+  // A wider dark stroke underneath reads the same as a drop shadow against a
+  // busy camera feed, without shadowBlur's per-frame software blur pass.
+  ctx.lineWidth = 4;
+  ctx.strokeStyle = "rgba(0,0,0,0.45)";
+  ctx.stroke();
   ctx.lineWidth = 2;
   ctx.strokeStyle = "rgba(255,255,255,0.95)";
-  ctx.shadowColor = "rgba(0,0,0,0.5)";
-  ctx.shadowBlur = 6;
   ctx.stroke();
 
   ctx.setLineDash([]);
   ctx.lineDashOffset = 0;
-  ctx.shadowBlur = 0;
   q.forEach((p, i) => {
     const r = 7 + Math.sin(t * 3 + i * 1.5) * 1.5;
     // Soft expanding halo behind each corner dot.
@@ -431,76 +555,132 @@ function drawFrameOutline(q) {
   ctx.restore();
 }
 
-function loop() {
-  const w = canvas.width;
-  const h = canvas.height;
+// Fold one new measurement of a corner into its filtered position + velocity.
+function updateCorner(c, target, dt) {
+  const rawVx = (target.x - c.x) / dt;
+  const rawVy = (target.y - c.y) / dt;
+  const aD = lpAlpha(dt, DERIV_CUTOFF);
+  c.vx += (rawVx - c.vx) * aD;
+  c.vy += (rawVy - c.vy) * aD;
+  // Cutoff rises with speed: still hands get smoothed, moving hands get followed.
+  const speed = Math.hypot(c.vx, c.vy) / canvas.width;
+  const a = lpAlpha(dt, MIN_CUTOFF + CUTOFF_SLOPE * speed);
+  c.x += (target.x - c.x) * a;
+  c.y += (target.y - c.y) * a;
+}
 
-  // Base layer: mirrored camera feed.
-  drawMirrored(ctx, w, h);
-
-  // Run detection once per new video frame.
+// Called once per camera frame. `mediaMs` is the frame's own timestamp (what
+// MediaPipe wants); `nowMs` is the wall clock (the extrapolation baseline).
+function detect(mediaMs, nowMs) {
+  const t0 = performance.now();
+  let results;
   if (DEMO) {
-    lastResults = { landmarks: fakeHands(performance.now() / 1000) };
-  } else if (video.currentTime !== lastVideoTime) {
-    lastVideoTime = video.currentTime;
-    lastResults = landmarker.detectForVideo(video, performance.now());
-  }
-
-  let targetQuad = null;
-  if (lastResults && lastResults.landmarks && lastResults.landmarks.length === 2) {
-    targetQuad = computeQuad(lastResults.landmarks);
-  }
-
-  if (targetQuad) {
-    if (!corners) {
-      lostFrames = 0;
-      frameActive = true;
-      jumpFrames = 0;
-      corners = targetQuad;
-      presence = Math.min(1, presence + 0.12);
-    } else {
-      const moved =
-        targetQuad.reduce((s, p, i) => s + dist(p, corners[i]), 0) / 4;
-      // Only quads that genuinely teleport (≥30% of the screen in one frame,
-      // beyond any real hand motion) are treated as suspect mis-detections.
-      if (moved > canvas.width * 0.3 && ++jumpFrames < JUMP_CONFIRM_FRAMES) {
-        if (++lostFrames > MAX_LOST_FRAMES) {
-          presence = Math.max(0, presence - 0.05);
-        }
-      } else {
-        lostFrames = 0;
-        frameActive = true;
-        jumpFrames = 0;
-        // Velocity-adaptive smoothing: damp pixel jitter when nearly still,
-        // follow at high gain the moment the hands genuinely move.
-        const alpha = Math.min(
-          0.85,
-          Math.max(0.35, moved / (canvas.width * 0.05))
-        );
-        corners = corners.map((c, i) => lerpPt(c, targetQuad[i], alpha));
-        presence = Math.min(1, presence + 0.12);
-      }
-    }
-  } else if (corners && ++lostFrames <= MAX_LOST_FRAMES) {
-    // Brief tracking dropout: hold the last quad instead of fading.
-    presence = Math.min(1, presence + 0.12);
+    results = { landmarks: fakeHands(mediaMs / 1000) };
   } else {
-    presence = Math.max(0, presence - 0.05);
-    if (presence === 0) {
+    results = landmarker.detectForVideo(video, mediaMs);
+  }
+  ema(detectMs, performance.now() - t0);
+  if (lastDetectAt) detectHz = 1000 / Math.max(1, nowMs - lastDetectAt);
+
+  const targetQuad =
+    results?.landmarks?.length === 2 ? computeQuad(results.landmarks) : null;
+
+  // Seconds since the previous measurement — the filter's true timestep, which
+  // is a camera interval and not a display interval.
+  const dt = lastDetectAt ? Math.min(0.2, (nowMs - lastDetectAt) / 1000) : 1 / 30;
+  lastDetectAt = nowMs;
+
+  if (!targetQuad) {
+    // Brief tracking dropout: hold the last quad instead of fading. Bleed
+    // velocity off so a held quad coasts to a stop rather than flying away.
+    if (corners && ++lostFrames <= MAX_LOST_FRAMES) {
+      for (const c of corners) {
+        c.vx *= 0.6;
+        c.vy *= 0.6;
+      }
+    } else if (corners) {
       corners = null;
       frameActive = false;
       jumpFrames = 0;
     }
+    return;
   }
 
+  if (!corners) {
+    lostFrames = 0;
+    frameActive = true;
+    jumpFrames = 0;
+    corners = targetQuad.map((p) => ({ x: p.x, y: p.y, vx: 0, vy: 0 }));
+    return;
+  }
+
+  const moved = targetQuad.reduce((s, p, i) => s + dist(p, corners[i]), 0) / 4;
+  // Only quads that genuinely teleport (≥30% of the screen in one frame,
+  // beyond any real hand motion) are treated as suspect mis-detections.
+  if (moved > canvas.width * 0.3 && ++jumpFrames < JUMP_CONFIRM_FRAMES) {
+    lostFrames++;
+    return;
+  }
+  lostFrames = 0;
+  frameActive = true;
+  jumpFrames = 0;
+  corners.forEach((c, i) => updateCorner(c, targetQuad[i], dt));
+}
+
+// Where a corner will be when the pixels we are about to draw actually appear.
+function extrapolate(c, aheadS) {
+  let dx = c.vx * aheadS;
+  let dy = c.vy * aheadS;
+  // A constant-velocity model overshoots hard on direction reversal, so cap
+  // how far it is ever allowed to run ahead of the last real measurement.
+  const cap = canvas.width * MAX_EXTRAPOLATE_FRAC;
+  const mag = Math.hypot(dx, dy);
+  if (mag > cap) {
+    dx *= cap / mag;
+    dy *= cap / mag;
+  }
+  return { x: c.x + dx, y: c.y + dy };
+}
+
+function drawLoop(now) {
+  const t0 = performance.now();
+  const dt = lastDrawAt ? Math.min(0.1, (now - lastDrawAt) / 1000) : 1 / 60;
+  lastDrawAt = now;
+
+  const visible = corners && lostFrames <= MAX_LOST_FRAMES;
+  // Exponential approach with a time constant, so the fade is the same wall
+  // clock duration at 60Hz and 120Hz (per-frame steps were not).
+  const tau = visible ? PRESENCE_RISE : PRESENCE_FALL;
+  presence += ((visible ? 1 : 0) - presence) * (1 - Math.exp(-dt / tau));
+  if (!visible && presence < 0.01) {
+    presence = 0;
+    corners = null;
+  }
+
+  // The canvas is now overlay-only — the camera passthrough is the video
+  // element behind it, composited without a round trip through here.
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
   if (corners && presence > 0.01) {
-    applyEffect(corners);
-    drawFrameOutline(corners);
+    const aheadS = Math.min(
+      MAX_EXTRAPOLATE_MS,
+      now - lastDetectAt + PRESENT_LOOKAHEAD_MS
+    ) / 1000;
+    const quad = corners.map((c) => extrapolate(c, aheadS));
+    applyEffect(quad);
+    drawFrameOutline(quad);
   }
 
   hintEl.classList.toggle("hidden", presence > 0.5);
+  ema(drawMs, performance.now() - t0);
+  if (hudOn) {
+    hudEl.textContent =
+      `detect ${detectMs.avg.toFixed(1)}ms @ ${detectHz.toFixed(0)}Hz   ` +
+      `draw ${drawMs.avg.toFixed(2)}ms   ` +
+      `predicted ${Math.max(0, now - lastDetectAt).toFixed(0)}ms ahead`;
+  }
 
-  requestAnimationFrame(loop);
+  requestAnimationFrame(drawLoop);
 }
 
 // ---- Demo mode helpers ----

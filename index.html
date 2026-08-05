@@ -20,12 +20,24 @@
       align-items: center;
       justify-content: center;
     }
-    canvas {
+    #shell {
+      position: relative;
+      width: 100%;
       max-width: 100%;
       max-height: 100%;
+      aspect-ratio: 16 / 9;
       border-radius: 12px;
+      overflow: hidden;
     }
-    video { display: none; }
+    #shell > * { position: absolute; inset: 0; width: 100%; height: 100%; }
+    /* Camera passthrough is the compositor's job, not ours. Showing the video
+       element directly (CSS-mirrored) instead of blitting it into the canvas
+       every frame saves a full-resolution drawImage and, more importantly,
+       takes the passthrough off the canvas' one-frame present path. The canvas
+       on top is transparent and carries only the AI window and the outline. */
+    #video { object-fit: fill; transform: scaleX(-1); }
+    /* Offscreen decode target, sampled by the canvas. */
+    #lucy { display: none; }
 
     #status {
       position: fixed;
@@ -105,6 +117,25 @@
     }
     #live-pill.connecting .dot { background: #ffc24b; }
     #live-pill.error .dot { background: #ff6b5e; animation: none; }
+
+    /* Latency HUD (press L) — measures the pipeline it is reporting on. */
+    #hud {
+      position: fixed;
+      top: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 7;
+      font: 11px/1.6 ui-monospace, monospace;
+      white-space: pre;
+      padding: 8px 12px;
+      border-radius: 10px;
+      background: rgba(20,20,24,0.78);
+      border: 1px solid rgba(255,255,255,0.12);
+      backdrop-filter: blur(12px);
+      color: rgba(255,255,255,0.85);
+      pointer-events: none;
+    }
+    #hud.hidden { display: none; }
 
     #key-btn {
       position: fixed;
@@ -233,10 +264,14 @@
   </div>
 
   <div id="stage">
-    <video id="video" autoplay playsinline muted></video>
-    <video id="lucy" autoplay playsinline muted></video>
-    <canvas id="canvas"></canvas>
+    <div id="shell">
+      <video id="video" autoplay playsinline muted></video>
+      <video id="lucy" autoplay playsinline muted></video>
+      <canvas id="canvas"></canvas>
+    </div>
   </div>
+
+  <div id="hud" class="hidden"></div>
 
   <div id="hint">
     <div id="hint-text">Frame your shot 🎬 — both hands up, thumbs and index fingers out.</div>
